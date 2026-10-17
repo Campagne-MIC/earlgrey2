@@ -13,6 +13,37 @@ pub struct EarleyParser {
 #[derive(Debug)]
 pub struct ParseTrees(pub Vec<Rc<Span>>);
 
+/// Structured recognition failure from [`EarleyParser::parse_with_diagnostics`].
+/// Positions index input tokens, not bytes or characters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ParseDiagnostic {
+    /// Zero-based index of the first token that could not advance the chart,
+    /// or the input token count when a valid prefix ended too soon.
+    pub token_index: usize,
+    /// Sorted, deduplicated names of terminals expected at that position.
+    pub expected: Vec<String>,
+    /// Whether the prefix before that token already completed the start rule.
+    pub expected_end_of_input: bool,
+}
+
+impl std::fmt::Display for ParseDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut expected = self.expected.clone();
+        if self.expected_end_of_input {
+            expected.push("end of input".to_string());
+        }
+        write!(
+            f,
+            "Parse Error: No Rule completes at token {}; expected: {}",
+            self.token_index,
+            expected.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for ParseDiagnostic {}
+
 ///////////////////////////////////////////////////////////////////////////////
 
 impl EarleyParser {
@@ -65,7 +96,18 @@ impl EarleyParser {
             })
     }
 
-    pub fn parse<T>(&self, mut tokenizer: T) -> Result<ParseTrees, String>
+    pub fn parse<T>(&self, tokenizer: T) -> Result<ParseTrees, String>
+    where
+        T: Iterator,
+        T::Item: Debug + AsRef<str>,
+    {
+        self.parse_with_diagnostics(tokenizer)
+            .map_err(|_| "Parse Error: No Rule completes".to_string())
+    }
+
+    /// Parse with the same recognition and forest construction as [`Self::parse`],
+    /// retaining the failed chart position and its expected terminal names.
+    pub fn parse_with_diagnostics<T>(&self, mut tokenizer: T) -> Result<ParseTrees, ParseDiagnostic>
     where
         T: Iterator,
         T::Item: Debug + AsRef<str>,
@@ -80,6 +122,7 @@ impl EarleyParser {
             .collect();
 
         let mut statesets = vec![s0];
+        let mut first_failure = None;
 
         // New statesets are generated from input stream (Scans)
         for idx in 0.. {
@@ -126,9 +169,12 @@ impl EarleyParser {
             }
             // Build Si+1 with items in the current state that accept the next token
             if let Some(lexeme) = tokenizer.next() {
-                statesets.push(
-                    EarleyParser::scans(statesets[idx].iter(), lexeme.as_ref(), idx + 1).collect(),
-                );
+                let next: HashSet<_> =
+                    EarleyParser::scans(statesets[idx].iter(), lexeme.as_ref(), idx + 1).collect();
+                if next.is_empty() && first_failure.is_none() {
+                    first_failure = Some(self.diagnostic(&statesets[idx], idx));
+                }
+                statesets.push(next);
             } else {
                 break;
             }
@@ -156,9 +202,9 @@ impl EarleyParser {
         // Check that at least one item is a. complete, b. starts at the idx 0,
         // and c. the name of the rule matches the starting symbol.
         // It spans the whole input because we search at the last stateset
-        let parse_trees: Vec<_> = statesets
-            .pop()
-            .expect("No Statesets (even s0)")
+        let final_index = statesets.len() - 1;
+        let final_stateset = statesets.pop().expect("No Statesets (even s0)");
+        let parse_trees: Vec<_> = final_stateset
             .iter()
             .filter(|item| {
                 item.start == 0 && item.complete() && item.rule.head == self.grammar.start
@@ -166,7 +212,9 @@ impl EarleyParser {
             .cloned()
             .collect();
         if parse_trees.is_empty() {
-            return Err("Parse Error: No Rule completes".to_string());
+            return Err(
+                first_failure.unwrap_or_else(|| self.diagnostic(&final_stateset, final_index))
+            );
         }
         if cfg!(feature = "debug") {
             eprintln!("=== Parse Chart ===");
@@ -175,5 +223,23 @@ impl EarleyParser {
             }
         }
         Ok(ParseTrees(parse_trees))
+    }
+
+    fn diagnostic(&self, stateset: &HashSet<Rc<Span>>, token_index: usize) -> ParseDiagnostic {
+        let mut expected: Vec<_> = stateset
+            .iter()
+            .filter_map(|item| item.next_symbol())
+            .filter(|symbol| symbol.is_terminal())
+            .map(|symbol| symbol.name().to_string())
+            .collect();
+        expected.sort();
+        expected.dedup();
+        ParseDiagnostic {
+            token_index,
+            expected,
+            expected_end_of_input: stateset.iter().any(|item| {
+                item.start == 0 && item.complete() && item.rule.head == self.grammar.start
+            }),
+        }
     }
 }

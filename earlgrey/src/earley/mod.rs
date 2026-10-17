@@ -5,7 +5,7 @@ pub use grammar::{Grammar, GrammarBuilder};
 
 mod parser;
 mod spans;
-pub use parser::EarleyParser;
+pub use parser::{EarleyParser, ParseDiagnostic};
 
 mod trees;
 pub use trees::{EarleyForest, ForestWalkError};
