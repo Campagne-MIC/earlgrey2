@@ -146,6 +146,33 @@ mod math {
         // Test evaluation of the unique parse tree.
         assert_eq!(evaler.eval(&pout).unwrap(), expected_tree);
         assert_eq!(evaler.eval_recursive(&pout).unwrap(), expected_tree);
+
+        // Positions come from the failing chart, not the final empty stateset.
+        // In particular, junk following the first bad token cannot move it.
+        for (input, index, expected, end) in [
+            ("1 + ? trailing", 2, vec!["(", "Number"], false),
+            ("1 +", 2, vec!["(", "Number"], false),
+            ("?", 0, vec!["(", "Number"], false),
+            ("", 0, vec!["(", "Number"], false),
+            ("1 ? trailing", 1, vec!["[*/]", "[+-]", "[^]"], true),
+            ("( 1", 2, vec![")", "[*/]", "[+-]", "[^]"], false),
+        ] {
+            let error = p
+                .parse_with_diagnostics(input.split_whitespace())
+                .unwrap_err();
+            assert_eq!(error.token_index, index, "{input}");
+            assert_eq!(error.expected, expected, "{input}");
+            assert_eq!(error.expected_end_of_input, end, "{input}");
+            assert_eq!(
+                p.parse(input.split_whitespace()).unwrap_err(),
+                "Parse Error: No Rule completes",
+                "legacy API: {input}"
+            );
+        }
+        let rich = p
+            .parse_with_diagnostics("1 + ( 2 * 3 - 4 )".split_whitespace())
+            .unwrap();
+        assert_eq!(evaler.eval(&rich).unwrap(), expected_tree);
     }
 }
 
