@@ -47,3 +47,21 @@ Rust source compatibility: direct rule/symbol construction uses `Arc` in
 place of `Rc`, and both terminal builder methods and `EbnfGrammarParser::plug_terminal` require the new predicate
 bounds. Recognition, diagnostics, rule equality and forest traversal keep
 their existing behavior.
+
+
+### Prefix recognition
+
+`EarleyParser::recognize_prefix(tokens)` reports one closed chart position per
+accepted token boundary, including the empty prefix. Each position owns sorted,
+unique expected terminal names, predicted nonterminal names, completed
+`(head, start)` pairs and dotted-rule keys (`rule`, `dot`, `start`). These facts
+let a client map its own semantic metadata without retaining a chart or forest.
+`accepts` means that the start rule is complete at that position. An incomplete
+but viable prefix is not a failure; `stopped` records the first token that cannot
+advance, using the same diagnostic as `parse_with_diagnostics`. Recognition
+consumes that failed token but does not request the remaining iterator tail.
+
+Parsing and prefix recognition share predict/complete/scan closure. Parsing
+still consumes its whole input and builds the same forest; prefix recognition
+returns only owned data (`Send + Sync`), never chart nodes or terminal predicates.
+The names are parser metadata, not user-facing completion text.

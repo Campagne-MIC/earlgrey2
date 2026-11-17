@@ -3,6 +3,7 @@
 mod earley;
 pub use earley::{
     EarleyForest, EarleyParser, ForestWalkError, Grammar, GrammarBuilder, ParseDiagnostic,
+    PrefixPosition, PrefixRecognition, PrefixRule,
 };
 
 mod ebnf;
