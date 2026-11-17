@@ -1,13 +1,13 @@
 #![deny(warnings)]
 
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::{fmt, hash};
 
 pub enum Symbol {
     NonTerm(String),
     // A terminal has a predicate to validate that input is accepted
-    Term(String, Box<dyn Fn(&str) -> bool>),
+    Term(String, Box<dyn Fn(&str) -> bool + Send + Sync>),
 }
 
 impl Symbol {
@@ -73,12 +73,12 @@ impl fmt::Debug for Symbol {
 #[derive(PartialEq, Hash)]
 pub struct Rule {
     pub head: String,
-    pub spec: Vec<Rc<Symbol>>,
+    pub spec: Vec<Arc<Symbol>>,
 }
 
 impl Rule {
     #[cfg(test)]
-    pub fn new(head: &str, spec: &[Rc<Symbol>]) -> Self {
+    pub fn new(head: &str, spec: &[Arc<Symbol>]) -> Self {
         Rule {
             head: head.to_string(),
             spec: spec.iter().cloned().collect(),
@@ -107,10 +107,12 @@ impl fmt::Debug for Rule {
     }
 }
 
+/// Immutable grammar data may be shared across parser workers. Parse charts
+/// and forests remain local to each parser invocation.
 #[derive(Clone)]
 pub struct Grammar {
     pub start: String,
-    pub rules: Vec<Rc<Rule>>,
+    pub rules: Vec<Arc<Rule>>,
     /// Priorities keyed by canonical `"head -> sym1 sym2 ..."` form
     /// matching `Rule::to_string()`. Consumed by `EarleyForest` via
     /// `with_priorities_from`. Empty by default.
@@ -144,8 +146,8 @@ impl fmt::Debug for Grammar {
 
 #[derive(Default)]
 pub struct GrammarBuilder {
-    symbols: HashMap<String, Rc<Symbol>>,
-    rules: Vec<Rc<Rule>>,
+    symbols: HashMap<String, Arc<Symbol>>,
+    rules: Vec<Arc<Rule>>,
     rule_priorities: HashMap<String, i32>,
     error: Option<String>,
 }
@@ -156,7 +158,7 @@ impl GrammarBuilder {
         // Check for duplicate symbols to avoid overwriting by mistake
         if !self.symbols.contains_key(symbol.name()) {
             self.symbols
-                .insert(symbol.name().to_string(), Rc::new(symbol));
+                .insert(symbol.name().to_string(), Arc::new(symbol));
         } else if !ignore_dups {
             // Convenience for adding symbols programatically
             self.error = Some(format!("Duplicate Symbol: {}", symbol.name()));
@@ -168,7 +170,11 @@ impl GrammarBuilder {
         self
     }
 
-    pub fn terminal(mut self, name: &str, pred: impl Fn(&str) -> bool + 'static) -> Self {
+    pub fn terminal(
+        mut self,
+        name: &str,
+        pred: impl Fn(&str) -> bool + Send + Sync + 'static,
+    ) -> Self {
         self.add_symbol(Symbol::Term(name.into(), Box::new(pred)), false);
         self
     }
@@ -177,7 +183,11 @@ impl GrammarBuilder {
         self.add_symbol(Symbol::NonTerm(name.into()), true);
     }
 
-    pub fn terminal_try(&mut self, name: &str, pred: impl Fn(&str) -> bool + 'static) {
+    pub fn terminal_try(
+        &mut self,
+        name: &str,
+        pred: impl Fn(&str) -> bool + Send + Sync + 'static,
+    ) {
         self.add_symbol(Symbol::Term(name.into(), Box::new(pred)), true);
     }
 
@@ -199,11 +209,11 @@ impl GrammarBuilder {
             return;
         }
         // Build the rule
-        let rule = Rc::new(Rule {
+        let rule = Arc::new(Rule {
             head: head.to_string(),
             spec: spec.iter().map(|&s| self.symbols[s].clone()).collect(),
         });
-        // Check this rule is only added once. NOTE: `Rc`s equal on inner value
+        // Check this rule is only added once. NOTE: `Arc`s equal on inner value
         if !self.rules.contains(&rule) {
             self.rules.push(rule);
         } else if !ignore_dups {
@@ -257,7 +267,7 @@ impl GrammarBuilder {
 
 #[cfg(test)]
 mod tests {
-    use super::{GrammarBuilder, Symbol};
+    use super::{Grammar, GrammarBuilder, Rule, Symbol};
     use std::collections::HashSet;
 
     #[test]
@@ -292,7 +302,30 @@ mod tests {
             .rule("Sum", &["Sum", "+", "Num"])
             .rule("Sum", &["Num"])
             .into_grammar("Sum");
-        assert!(g.is_ok());
+        let grammar = g.unwrap();
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Grammar>();
+        assert_send_sync::<Rule>();
+        assert_send_sync::<Symbol>();
+        let moved = grammar.clone();
+        let returned = std::thread::spawn(move || {
+            // The grammar crosses the boundary; the chart and forest are born
+            // and dropped entirely on this worker.
+            assert!(
+                crate::EarleyParser::new(moved.clone())
+                    .parse(["1", "+", "2"].into_iter())
+                    .is_ok()
+            );
+            moved
+        })
+        .join()
+        .unwrap();
+        assert!(std::ptr::eq(&*grammar.rules[0], &*returned.rules[0]));
+        assert!(
+            crate::EarleyParser::new(grammar)
+                .parse(["1", "+", "2"].into_iter())
+                .is_ok()
+        );
     }
 
     #[test]

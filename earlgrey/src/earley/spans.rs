@@ -2,6 +2,7 @@
 
 use super::grammar::{Rule, Symbol};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::{cell, fmt, hash};
 
 #[derive(PartialEq, Eq, Hash, Debug, Clone)]
@@ -12,10 +13,10 @@ pub enum SpanSource {
 
 /// An Span is a partially matched `Rule`. `dot` shows the match progress.
 pub struct Span {
-    pub rule: Rc<Rule>, // LR0item (dotted rule)
-    pub dot: usize,     // dot position within the rule
-    pub start: usize,   // input stream position where item starts
-    pub end: usize,     // input stream position where item ends
+    pub rule: Arc<Rule>, // LR0item (dotted rule)
+    pub dot: usize,      // dot position within the rule
+    pub start: usize,    // input stream position where item starts
+    pub end: usize,      // input stream position where item ends
 
     // Need a RefCell to update existing Spans. A replacement with the union
     // of backpointers would invalidate other Spans already pointing to this one.
@@ -174,7 +175,7 @@ impl Span {
         }
     }
 
-    pub fn new(rule: &Rc<Rule>, start: usize) -> Span {
+    pub fn new(rule: &Arc<Rule>, start: usize) -> Span {
         Span {
             rule: rule.clone(),
             dot: 0,
@@ -207,20 +208,20 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    fn terminal(name: &str, pred: impl Fn(&str) -> bool + 'static) -> Rc<Symbol> {
-        Rc::new(Symbol::Term(name.to_string(), Box::new(pred)))
+    fn terminal(name: &str, pred: impl Fn(&str) -> bool + Send + Sync + 'static) -> Arc<Symbol> {
+        Arc::new(Symbol::Term(name.to_string(), Box::new(pred)))
     }
 
-    fn nonterm(name: &str) -> Rc<Symbol> {
-        Rc::new(Symbol::NonTerm(name.to_string()))
+    fn nonterm(name: &str) -> Arc<Symbol> {
+        Arc::new(Symbol::NonTerm(name.to_string()))
     }
 
-    fn gen_rule1() -> Rc<Rule> {
+    fn gen_rule1() -> Arc<Rule> {
         fn testfn(o: &str) -> bool {
             o.len() == 1 && "+-".contains(o)
         }
         // S -> S +- d
-        Rc::new(Rule::new(
+        Arc::new(Rule::new(
             "S",
             &[
                 nonterm("S"),
@@ -230,12 +231,12 @@ mod tests {
         ))
     }
 
-    fn gen_rule2() -> Rc<Rule> {
+    fn gen_rule2() -> Arc<Rule> {
         fn testfn(o: &str) -> bool {
             o.len() == 1 && "*/".contains(o)
         }
         // S -> S */ d
-        Rc::new(Rule::new(
+        Arc::new(Rule::new(
             "S",
             &[
                 nonterm("S"),
@@ -245,7 +246,7 @@ mod tests {
         ))
     }
 
-    fn item(rule: Rc<Rule>, dot: usize, start: usize, end: usize) -> Span {
+    fn item(rule: Arc<Rule>, dot: usize, start: usize, end: usize) -> Span {
         Span {
             rule,
             dot,
@@ -267,14 +268,18 @@ mod tests {
         assert!(!item(rule2.clone(), 2, 0, 5).complete());
         assert!(item(rule2.clone(), 3, 0, 4).complete());
         // Check next symbol
-        assert!(!item(rule1.clone(), 0, 0, 5)
-            .next_symbol()
-            .unwrap()
-            .is_terminal());
-        assert!(item(rule1.clone(), 2, 0, 5)
-            .next_symbol()
-            .unwrap()
-            .is_terminal());
+        assert!(
+            !item(rule1.clone(), 0, 0, 5)
+                .next_symbol()
+                .unwrap()
+                .is_terminal()
+        );
+        assert!(
+            item(rule1.clone(), 2, 0, 5)
+                .next_symbol()
+                .unwrap()
+                .is_terminal()
+        );
     }
 
     #[test]
@@ -325,7 +330,7 @@ mod tests {
         let rule1 = gen_rule1();
         let source = Rc::new(item(rule1.clone(), 0, 0, 0));
         // rule3: S -> d
-        let rule3 = Rc::new(Rule::new(
+        let rule3 = Arc::new(Rule::new(
             "S",
             &[terminal("d", |n| n.chars().all(|c| "123".contains(c)))],
         ));
@@ -335,7 +340,7 @@ mod tests {
         let complete1 = Span::extend(SpanSource::Completion(source.clone(), trigger1.clone()), 1);
         assert_eq!(complete1, item(rule1.clone(), 1, 0, 1));
         // rule4: S -> hex
-        let rule4 = Rc::new(Rule::new("S", &[terminal("hex", |n| n == "0x3")]));
+        let rule4 = Arc::new(Rule::new("S", &[terminal("hex", |n| n == "0x3")]));
         // S -> hex .
         let trigger3 = Rc::new(item(rule4, 1, 0, 1));
         // S -> S . + d
