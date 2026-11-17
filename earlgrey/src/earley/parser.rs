@@ -27,6 +27,44 @@ pub struct ParseDiagnostic {
     pub expected_end_of_input: bool,
 }
 
+/// One active dotted production at a recognized prefix. All data is owned;
+/// no chart, rule handle, predicate or parse-forest node escapes recognition.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+pub struct PrefixRule {
+    /// The same canonical `head -> rhs` key used by forest actions.
+    pub rule: String,
+    pub dot: usize,
+    pub start: usize,
+}
+
+/// A closed chart position after exactly `token_index` accepted tokens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PrefixPosition {
+    pub token_index: usize,
+    /// Sorted, unique terminal names that can consume the next token.
+    pub expected: Vec<String>,
+    /// Sorted, unique nonterminal names predicted at this position.
+    pub predicted: Vec<String>,
+    /// Sorted, unique completed (head, starting-token-index) pairs.
+    pub completed: Vec<(String, usize)>,
+    /// Sorted, unique dotted rules, for client-owned semantic metadata.
+    pub active_rules: Vec<PrefixRule>,
+    /// Whether ending the input here completes the grammar's start rule.
+    pub accepts: bool,
+}
+
+/// Recognition facts for every accepted prefix, including the empty prefix.
+/// An incomplete but viable prefix has no `stopped` diagnostic. A token that
+/// cannot advance the chart sets `stopped`; its empty state is not a position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PrefixRecognition {
+    pub positions: Vec<PrefixPosition>,
+    pub stopped: Option<ParseDiagnostic>,
+}
+
 impl std::fmt::Display for ParseDiagnostic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut expected = self.expected.clone();
@@ -107,7 +145,117 @@ impl EarleyParser {
 
     /// Parse with the same recognition and forest construction as [`Self::parse`],
     /// retaining the failed chart position and its expected terminal names.
-    pub fn parse_with_diagnostics<T>(&self, mut tokenizer: T) -> Result<ParseTrees, ParseDiagnostic>
+    pub fn parse_with_diagnostics<T>(&self, tokenizer: T) -> Result<ParseTrees, ParseDiagnostic>
+    where
+        T: Iterator,
+        T::Item: Debug + AsRef<str>,
+    {
+        let (mut statesets, first_failure) = self.build_chart(tokenizer, false);
+
+        // debug StateSets
+        if cfg!(feature = "debug") {
+            for (idx, stateset) in statesets.iter().enumerate() {
+                eprintln!("=== StateSet {} ===", idx);
+                stateset
+                    .iter()
+                    .inspect(|item| {
+                        let src = item
+                            .sources()
+                            .iter()
+                            .map(|bp| format!("{:?}", bp))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        eprintln!("{:?} -- SRC: {}", item, src);
+                    })
+                    .count();
+            }
+        }
+
+        // Check that at least one item is a. complete, b. starts at the idx 0,
+        // and c. the name of the rule matches the starting symbol.
+        // It spans the whole input because we search at the last stateset
+        let final_index = statesets.len() - 1;
+        let final_stateset = statesets.pop().expect("No Statesets (even s0)");
+        let parse_trees: Vec<_> = final_stateset
+            .iter()
+            .filter(|item| {
+                item.start == 0 && item.complete() && item.rule.head == self.grammar.start
+            })
+            .cloned()
+            .collect();
+        if parse_trees.is_empty() {
+            return Err(
+                first_failure.unwrap_or_else(|| self.diagnostic(&final_stateset, final_index))
+            );
+        }
+        if cfg!(feature = "debug") {
+            eprintln!("=== Parse Chart ===");
+            for t in &parse_trees {
+                eprintln!("{}", t.stringify(0));
+            }
+        }
+        Ok(ParseTrees(parse_trees))
+    }
+
+    /// Recognize a prefix without exposing the chart or constructing a forest
+    /// result. Consumes at most the first failing token; the remaining iterator
+    /// is untouched. Terminal predicates and nullable closure are exactly those
+    /// used by `parse_with_diagnostics`.
+    pub fn recognize_prefix<T>(&self, tokenizer: T) -> PrefixRecognition
+    where
+        T: Iterator,
+        T::Item: Debug + AsRef<str>,
+    {
+        let (statesets, stopped) = self.build_chart(tokenizer, true);
+        let positions = statesets
+            .iter()
+            .enumerate()
+            .map(|(token_index, stateset)| {
+                let diagnostic = self.diagnostic(stateset, token_index);
+                let mut predicted: Vec<_> = stateset
+                    .iter()
+                    .filter_map(|item| match item.next_symbol() {
+                        Some(Symbol::NonTerm(name)) => Some(name.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                predicted.sort();
+                predicted.dedup();
+                let mut completed: Vec<_> = stateset
+                    .iter()
+                    .filter(|item| item.complete())
+                    .map(|item| (item.rule.head.clone(), item.start))
+                    .collect();
+                completed.sort();
+                completed.dedup();
+                let mut active_rules: Vec<_> = stateset
+                    .iter()
+                    .map(|item| PrefixRule {
+                        rule: item.rule.to_string(),
+                        dot: item.dot,
+                        start: item.start,
+                    })
+                    .collect();
+                active_rules.sort();
+                active_rules.dedup();
+                PrefixPosition {
+                    token_index,
+                    expected: diagnostic.expected,
+                    predicted,
+                    completed,
+                    active_rules,
+                    accepts: diagnostic.expected_end_of_input,
+                }
+            })
+            .collect();
+        PrefixRecognition { positions, stopped }
+    }
+
+    fn build_chart<T>(
+        &self,
+        mut tokenizer: T,
+        stop_at_failure: bool,
+    ) -> (Vec<HashSet<Rc<Span>>>, Option<ParseDiagnostic>)
     where
         T: Iterator,
         T::Item: Debug + AsRef<str>,
@@ -173,6 +321,9 @@ impl EarleyParser {
                     EarleyParser::scans(statesets[idx].iter(), lexeme.as_ref(), idx + 1).collect();
                 if next.is_empty() && first_failure.is_none() {
                     first_failure = Some(self.diagnostic(&statesets[idx], idx));
+                    if stop_at_failure {
+                        break;
+                    }
                 }
                 statesets.push(next);
             } else {
@@ -180,49 +331,7 @@ impl EarleyParser {
             }
         }
 
-        // debug StateSets
-        if cfg!(feature = "debug") {
-            for (idx, stateset) in statesets.iter().enumerate() {
-                eprintln!("=== StateSet {} ===", idx);
-                stateset
-                    .iter()
-                    .inspect(|item| {
-                        let src = item
-                            .sources()
-                            .iter()
-                            .map(|bp| format!("{:?}", bp))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        eprintln!("{:?} -- SRC: {}", item, src);
-                    })
-                    .count();
-            }
-        }
-
-        // Check that at least one item is a. complete, b. starts at the idx 0,
-        // and c. the name of the rule matches the starting symbol.
-        // It spans the whole input because we search at the last stateset
-        let final_index = statesets.len() - 1;
-        let final_stateset = statesets.pop().expect("No Statesets (even s0)");
-        let parse_trees: Vec<_> = final_stateset
-            .iter()
-            .filter(|item| {
-                item.start == 0 && item.complete() && item.rule.head == self.grammar.start
-            })
-            .cloned()
-            .collect();
-        if parse_trees.is_empty() {
-            return Err(
-                first_failure.unwrap_or_else(|| self.diagnostic(&final_stateset, final_index))
-            );
-        }
-        if cfg!(feature = "debug") {
-            eprintln!("=== Parse Chart ===");
-            for t in &parse_trees {
-                eprintln!("{}", t.stringify(0));
-            }
-        }
-        Ok(ParseTrees(parse_trees))
+        (statesets, first_failure)
     }
 
     fn diagnostic(&self, stateset: &HashSet<Rc<Span>>, token_index: usize) -> ParseDiagnostic {
