@@ -74,13 +74,18 @@ fn ebnf_grammar() -> Grammar {
         .rule("<VariantList>", &["<VariantList>", "|", "<Variant>"])
         .rule(
             "<VariantList>",
-            &["<VariantList>", "|", "<Variant>", "@prio", "(", "<Num>", ")"],
+            &[
+                "<VariantList>",
+                "|",
+                "<Variant>",
+                "@prio",
+                "(",
+                "<Num>",
+                ")",
+            ],
         )
         .rule("<VariantList>", &["<Variant>"])
-        .rule(
-            "<VariantList>",
-            &["<Variant>", "@prio", "(", "<Num>", ")"],
-        )
+        .rule("<VariantList>", &["<Variant>", "@prio", "(", "<Num>", ")"])
         .rule("<Variant>", &["<Variant>", "<Atom>"])
         .rule("<Variant>", &["<Atom>"])
         .rule("<Atom>", &["<Id>"])
@@ -118,7 +123,11 @@ fn ebnf_terminal_parser(
             }
             "<Num>" => {
                 // Priority literal — lifted numerically; no grammar side effects.
-                return G::Num(token.parse().expect("BUG: <Num> tokenizer emitted non-digits"));
+                return G::Num(
+                    token
+                        .parse()
+                        .expect("BUG: <Num> tokenizer emitted non-digits"),
+                );
             }
             _ => (),
         }
@@ -166,15 +175,12 @@ fn ebnf_variantlist_action(ev: &mut EarleyForest<'_, G>) {
         let part = pull!(G::Variant, n.remove(0));
         G::VariantList(vec![(part, None)])
     });
-    ev.action(
-        "<VariantList> -> <Variant> @prio ( <Num> )",
-        |mut n| {
-            // Spec positions: 0=Variant 1=@prio 2=( 3=Num 4=)
-            let prio = pull!(G::Num, n.remove(3));
-            let part = pull!(G::Variant, n.remove(0));
-            G::VariantList(vec![(part, Some(prio))])
-        },
-    );
+    ev.action("<VariantList> -> <Variant> @prio ( <Num> )", |mut n| {
+        // Spec positions: 0=Variant 1=@prio 2=( 3=Num 4=)
+        let prio = pull!(G::Num, n.remove(3));
+        let part = pull!(G::Variant, n.remove(0));
+        G::VariantList(vec![(part, Some(prio))])
+    });
 }
 
 fn ebnf_variant_action(ev: &mut EarleyForest<'_, G>) {
@@ -188,11 +194,7 @@ fn ebnf_variant_action(ev: &mut EarleyForest<'_, G>) {
     });
 }
 
-fn add_aux_variants(
-    t_gb: &mut GrammarBuilder,
-    aux: &str,
-    body: Vec<(Vec<String>, Option<i32>)>,
-) {
+fn add_aux_variants(t_gb: &mut GrammarBuilder, aux: &str, body: Vec<(Vec<String>, Option<i32>)>) {
     for (spec, prio) in body {
         debug!("Adding rule {:?} -> {:?} prio={:?}", aux, spec, prio);
         let spec_str: Vec<&str> = spec.iter().map(|s| s.as_str()).collect();
@@ -308,7 +310,11 @@ impl EbnfGrammarParser {
     }
 
     // Plug-in functions that parse Terminals before we build the grammar
-    pub fn plug_terminal(mut self, name: &str, pred: impl Fn(&str) -> bool + 'static) -> Self {
+    pub fn plug_terminal(
+        mut self,
+        name: &str,
+        pred: impl Fn(&str) -> bool + Send + Sync + 'static,
+    ) -> Self {
         debug!("Adding terminal {:?}", name);
         self.grammar_builder.terminal_try(name, pred);
         self
